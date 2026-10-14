@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net/netip"
 	"sync"
 )
@@ -22,6 +21,7 @@ type Pool struct {
 	broadcast netip.Addr
 	allocated map[netip.Addr]string
 	reserved  map[netip.Addr]struct{}
+	bySession map[string]netip.Addr
 }
 
 func NewPool(cidr string) (*Pool, error) {
@@ -34,7 +34,7 @@ func NewPool(cidr string) (*Pool, error) {
 		return nil, ErrInvalidPool
 	}
 
-	addr := prefix.Addr().As4()
+	addr := prefix.Masked().Addr().As4()
 	base := binary.BigEndian.Uint32(addr[:])
 	hostbit := uint(32 - prefix.Bits())
 
@@ -49,9 +49,10 @@ func NewPool(cidr string) (*Pool, error) {
 		broadcast: netip.AddrFrom4(broadcastBytes),
 		allocated: make(map[netip.Addr]string),
 		reserved: map[netip.Addr]struct{}{
-			prefix.Addr():                   {},
+			prefix.Masked().Addr():          {},
 			netip.AddrFrom4(broadcastBytes): {},
 		},
+		bySession: make(map[string]netip.Addr),
 	}, nil
 }
 
@@ -63,14 +64,11 @@ func (p *Pool) Allocate(sessionID string) (netip.Addr, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for ip, owner := range p.allocated {
-		if owner == sessionID {
-			return ip, ErrDuplicateSession
-		}
-
+	if _, exist := p.bySession[sessionID]; exist {
+		return netip.Addr{}, ErrDuplicateSession
 	}
 
-	for ip := p.prefix.Addr().Next(); p.prefix.Contains(ip); ip = ip.Next() {
+	for ip := p.prefix.Masked().Addr().Next(); p.prefix.Contains(ip); ip = ip.Next() {
 		if ip == p.broadcast {
 			break
 		}
@@ -84,8 +82,23 @@ func (p *Pool) Allocate(sessionID string) (netip.Addr, error) {
 		}
 
 		p.allocated[ip] = sessionID
+		p.bySession[sessionID] = ip
 		return ip, nil
 	}
 
 	return netip.Addr{}, ErrPoolExhausted
+}
+
+func (p *Pool) Release(sessionID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ip, ok := p.bySession[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	delete(p.bySession, sessionID)
+	delete(p.allocated, ip)
+	return nil
+
 }
